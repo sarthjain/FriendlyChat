@@ -15,11 +15,18 @@
  */
 package com.google.firebase.udacity.friendlychat;
 
+import android.content.Context;
+import android.content.Intent;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+import android.net.Uri;
 import android.os.Bundle;
+import android.support.annotation.NonNull;
 import android.support.v7.app.AppCompatActivity;
 import android.text.Editable;
 import android.text.InputFilter;
 import android.text.TextWatcher;
+import android.util.Log;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
@@ -27,11 +34,32 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.ProgressBar;
+import android.widget.Toast;
+
+import com.firebase.ui.auth.AuthUI;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.firebase.auth.FirebaseAuth;
+import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.database.ChildEventListener;
+import com.google.firebase.database.DataSnapshot;
+import com.google.firebase.database.DatabaseError;
+import com.google.firebase.database.DatabaseReference;
+import com.google.firebase.database.FirebaseDatabase;
+import com.google.firebase.remoteconfig.FirebaseRemoteConfig;
+import com.google.firebase.remoteconfig.FirebaseRemoteConfigSettings;
+import com.google.firebase.storage.FirebaseStorage;
+import com.google.firebase.storage.StorageReference;
+import com.google.firebase.storage.UploadTask;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -39,6 +67,9 @@ public class MainActivity extends AppCompatActivity {
 
     public static final String ANONYMOUS = "anonymous";
     public static final int DEFAULT_MSG_LENGTH_LIMIT = 1000;
+    public static final String FRIENDLY_CHAT_MESSAGE_LENGTH = "friendly_chat_length";
+    public static final int RC_SIGN_IN=1;
+    public static final int RC_PHOTO_ID=2;
 
     private ListView mMessageListView;
     private MessageAdapter mMessageAdapter;
@@ -46,6 +77,17 @@ public class MainActivity extends AppCompatActivity {
     private ImageButton mPhotoPickerButton;
     private EditText mMessageEditText;
     private Button mSendButton;
+    private LinearLayout mEmptyView;
+
+    //Firebase Variables
+    private FirebaseDatabase mFirebaseDatabase;
+    private DatabaseReference mMessagesDatabaseReference;
+    private ChildEventListener mChildEventListener;
+    private FirebaseAuth mFirebaseAuth;
+    private FirebaseAuth.AuthStateListener mAuthStateListener;
+    private FirebaseStorage mFirebaseStorage;
+    private StorageReference mChildPhotosStorageReference;
+    private FirebaseRemoteConfig mFirebaseRemoteConfig;
 
     private String mUsername;
 
@@ -56,17 +98,27 @@ public class MainActivity extends AppCompatActivity {
 
         mUsername = ANONYMOUS;
 
+        mFirebaseDatabase = FirebaseDatabase.getInstance();
+        mFirebaseAuth = FirebaseAuth.getInstance();
+        mFirebaseStorage = FirebaseStorage.getInstance();
+        mFirebaseRemoteConfig = FirebaseRemoteConfig.getInstance();
+
+        mMessagesDatabaseReference = mFirebaseDatabase.getReference().child("messages");
+        mChildPhotosStorageReference = mFirebaseStorage.getReference().child("child_photos");
+
         // Initialize references to views
         mProgressBar = (ProgressBar) findViewById(R.id.progressBar);
         mMessageListView = (ListView) findViewById(R.id.messageListView);
         mPhotoPickerButton = (ImageButton) findViewById(R.id.photoPickerButton);
         mMessageEditText = (EditText) findViewById(R.id.messageEditText);
         mSendButton = (Button) findViewById(R.id.sendButton);
+        mEmptyView = (LinearLayout) findViewById(R.id.emptyView);
 
         // Initialize message ListView and its adapter
-        List<FriendlyMessage> friendlyMessages = new ArrayList<>();
+        final List<FriendlyMessage> friendlyMessages = new ArrayList<>();
         mMessageAdapter = new MessageAdapter(this, R.layout.item_message, friendlyMessages);
         mMessageListView.setAdapter(mMessageAdapter);
+        mMessageListView.setEmptyView(mEmptyView);
 
         // Initialize progress bar
         mProgressBar.setVisibility(ProgressBar.INVISIBLE);
@@ -75,7 +127,10 @@ public class MainActivity extends AppCompatActivity {
         mPhotoPickerButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                // TODO: Fire an intent to show an image picker
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                i.setType("image/jpeg");
+                i.putExtra(Intent.EXTRA_LOCAL_ONLY, true);
+                startActivityForResult(i,RC_PHOTO_ID);
             }
         });
 
@@ -104,12 +159,90 @@ public class MainActivity extends AppCompatActivity {
         mSendButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                // TODO: Send messages on click
-
+                // Do: Send messages on click
+                FriendlyMessage friendlyMessage = new FriendlyMessage(mMessageEditText.getText().toString(),mUsername,null);
+                mMessagesDatabaseReference.push().setValue(friendlyMessage);
                 // Clear input box
                 mMessageEditText.setText("");
             }
         });
+
+        mAuthStateListener = new FirebaseAuth.AuthStateListener() {
+            @Override
+            public void onAuthStateChanged(@NonNull FirebaseAuth firebaseAuth) {
+                FirebaseUser user = firebaseAuth.getCurrentUser();
+                if(user!=null)
+                {
+                    //user is already logged in
+                   // Toast.makeText(MainActivity.this,"Welcome to FriendlyChatApp",Toast.LENGTH_SHORT).show();
+                    onSignedInitialize(user);
+                }
+                else{
+
+                    onSignedOutRemove();
+                    // Choose authentication providers
+                    List<AuthUI.IdpConfig> providers = Arrays.asList(
+                            new AuthUI.IdpConfig.Builder(AuthUI.EMAIL_PROVIDER).build(),
+                            new AuthUI.IdpConfig.Builder(AuthUI.GOOGLE_PROVIDER).build());
+
+                    // Create and launch sign-in intent
+                    startActivityForResult(
+                            AuthUI.getInstance()
+                                    .createSignInIntentBuilder()
+                                    .setIsSmartLockEnabled(false)
+                                    .setAvailableProviders(providers)
+                                    .build(),
+                            RC_SIGN_IN);
+                }
+            }
+        };
+
+        FirebaseRemoteConfigSettings remoteConfigSetting = new FirebaseRemoteConfigSettings.Builder()
+                .setDeveloperModeEnabled(BuildConfig.DEBUG)
+                .build();
+        mFirebaseRemoteConfig.setConfigSettings(remoteConfigSetting);
+
+        Map<String, Object> defaultConfigMap = new HashMap<>();
+        defaultConfigMap.put(FRIENDLY_CHAT_MESSAGE_LENGTH,DEFAULT_MSG_LENGTH_LIMIT);
+        mFirebaseRemoteConfig.setDefaults(defaultConfigMap);
+
+        fetchConfig();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if(requestCode == RC_SIGN_IN)
+        {
+            if(resultCode == RESULT_OK)
+            {
+                Toast.makeText(this,"Signed in",Toast.LENGTH_SHORT).show();
+            }
+            else if(resultCode == RESULT_CANCELED) {
+                ConnectivityManager connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                NetworkInfo nI = connectivityManager.getActiveNetworkInfo();
+                if (nI != null && nI.isConnectedOrConnecting()) {
+                    Toast.makeText(this, "SignIn Cancelled", Toast.LENGTH_LONG).show();
+                    finish();
+                }
+                else{
+                    Toast.makeText(this, "Connect to the Internet", Toast.LENGTH_LONG).show();
+                    finish();
+                }
+            }
+        }
+        else if(requestCode == RC_PHOTO_ID && resultCode == RESULT_OK)
+        {
+            Uri photoUri = data.getData();
+            StorageReference mStorage = mChildPhotosStorageReference.child(photoUri.getLastPathSegment());
+            mStorage.putFile(photoUri).addOnSuccessListener(this, new OnSuccessListener<UploadTask.TaskSnapshot>(){
+                @Override
+                public void onSuccess(UploadTask.TaskSnapshot taskSnapshot) {
+                    Uri url = taskSnapshot.getDownloadUrl();
+                    mMessagesDatabaseReference.push().setValue(new FriendlyMessage(null,mUsername,url.toString()));
+                }
+            });
+        }
     }
 
     @Override
@@ -121,6 +254,108 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        return super.onOptionsItemSelected(item);
+        switch (item.getItemId()) {
+            case R.id.sign_out_menu:
+                AuthUI.getInstance().signOut(this);
+                return true;
+            default:
+            return super.onOptionsItemSelected(item);
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        mFirebaseAuth.addAuthStateListener(mAuthStateListener);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if(mFirebaseAuth != null)
+            mFirebaseAuth.removeAuthStateListener(mAuthStateListener);
+        detachDatabseReadListener();
+        mMessageAdapter.clear();
+    }
+
+    private void onSignedInitialize(FirebaseUser user){
+        mUsername = user.getDisplayName();
+        attachDatabaseReadListener();
+    }
+
+    private void onSignedOutRemove() {
+        mUsername = ANONYMOUS;
+        detachDatabseReadListener();
+        mMessageAdapter.clear();
+    }
+
+    private void attachDatabaseReadListener(){
+        if(mChildEventListener == null) {
+            mChildEventListener = new ChildEventListener() {
+
+                FriendlyMessage mFriendlyMessage=null;
+                @Override
+                public void onChildAdded(DataSnapshot dataSnapshot, String s) {
+                    FriendlyMessage friendlyMessage = dataSnapshot.getValue(FriendlyMessage.class);
+                    mMessageAdapter.add(friendlyMessage);
+                    mFriendlyMessage = friendlyMessage;
+                }
+
+                @Override
+                public void onChildChanged(DataSnapshot dataSnapshot, String s) {
+                    mMessageAdapter.remove(mFriendlyMessage);
+                    FriendlyMessage friendlyMessage = dataSnapshot.getValue(FriendlyMessage.class);
+                    mMessageAdapter.add(friendlyMessage);
+                }
+
+                @Override
+                public void onChildRemoved(DataSnapshot dataSnapshot) {
+                }
+
+                @Override
+                public void onChildMoved(DataSnapshot dataSnapshot, String s) {
+                }
+
+                @Override
+                public void onCancelled(DatabaseError databaseError) {
+                }
+
+            };
+            mMessagesDatabaseReference.addChildEventListener(mChildEventListener);
+        }
+    }
+
+    private void detachDatabseReadListener() {
+        if (mChildEventListener != null) {
+            mMessagesDatabaseReference.removeEventListener(mChildEventListener);
+            mChildEventListener = null;
+        }
+    }
+
+    public void fetchConfig()
+    {
+        long cacheExpiration = 3600;
+        if(mFirebaseRemoteConfig.getInfo().getConfigSettings().isDeveloperModeEnabled())
+            cacheExpiration=0;
+        mFirebaseRemoteConfig.fetch(cacheExpiration).addOnSuccessListener(new OnSuccessListener<Void>() {
+                @Override
+                public void onSuccess(Void aVoid) {
+                    mFirebaseRemoteConfig.activateFetched();
+                    applyLengthLimit();
+                }
+        }).addOnFailureListener(new OnFailureListener() {
+            @Override
+            public void onFailure(@NonNull Exception e) {
+                Log.d(TAG,"Error in retreiving config");
+                applyLengthLimit();
+            }
+        });
+    }
+
+    private void applyLengthLimit()
+    {
+        Long friendly_chat_length = mFirebaseRemoteConfig.getLong(FRIENDLY_CHAT_MESSAGE_LENGTH);
+        mMessageEditText.setFilters(new InputFilter[]{new InputFilter.LengthFilter(friendly_chat_length.intValue())});
+        Log.d(TAG,"Message Length = "+friendly_chat_length.toString());
     }
 }
